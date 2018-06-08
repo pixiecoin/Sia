@@ -1,7 +1,6 @@
 package siatest
 
 import (
-	"fmt"
 	"math"
 	"reflect"
 	"strconv"
@@ -86,15 +85,14 @@ func NewGroup(nodeParams ...node.NodeParams) (*TestGroup, error) {
 	if len(tg.miners) == 0 {
 		return nil, errors.New("cannot fund group without miners")
 	}
-	// Fully connect nodes
 	miner := tg.Miners()[0]
 	for i := types.BlockHeight(0); i <= types.MaturityDelay+types.TaxHardforkHeight; i++ {
 		if err := miner.MineBlock(); err != nil {
 			return nil, errors.AddContext(err, "failed to mine block for funding")
 		}
 	}
-
-	return tg, tg.SetupNodes(tg.hosts, tg.nodes, tg.renters)
+	// Fully connect nodes
+	return tg, tg.setupNodes(tg.hosts, tg.nodes, tg.renters)
 }
 
 // NewGroupFromTemplate will create hosts, renters and miners according to the
@@ -231,6 +229,9 @@ func fundNodes(miner *TestNode, nodes map[*TestNode]struct{}) error {
 // database.
 func hostsInRenterDBCheck(miner *TestNode, renters map[*TestNode]struct{}, hosts map[*TestNode]struct{}) error {
 	for renter := range renters {
+		if renter.params.SkipHostDiscovery {
+			continue
+		}
 		for host := range hosts {
 			numRetries := 0
 			err := Retry(100, 100*time.Millisecond, func() error {
@@ -294,40 +295,46 @@ func setRenterAllowances(renters map[*TestNode]struct{}) error {
 }
 
 // synchronizationCheck makes sure that all the nodes are synced and follow the
-func synchronizationCheck(miner *TestNode, nodes map[*TestNode]struct{}) error {
-	mcg, err := miner.ConsensusGet()
+func synchronizationCheck(nodes map[*TestNode]struct{}) error {
+	// Get node with longest chain.
+	var longestChainNode *TestNode
+	var longestChain types.BlockHeight
+	for n := range nodes {
+		ncg, err := n.ConsensusGet()
+		if err != nil {
+			return err
+		}
+		if ncg.Height > longestChain {
+			longestChain = ncg.Height
+			longestChainNode = n
+		}
+	}
+	lcg, err := longestChainNode.ConsensusGet()
 	if err != nil {
 		return err
 	}
-	// Loop until all the blocks have the same CurrentBlock. If we need to mine
-	// a new block in between we need to repeat the check until no block was
-	// mined.
-	for node := range nodes {
+	// Loop until all the blocks have the same CurrentBlock.
+	for n := range nodes {
 		err := Retry(600, 100*time.Millisecond, func() error {
-			ncg, err := node.ConsensusGet()
+			ncg, err := n.ConsensusGet()
 			if err != nil {
 				return err
 			}
 			// If the CurrentBlock's match we are done.
-			if mcg.CurrentBlock == ncg.CurrentBlock {
+			if lcg.CurrentBlock == ncg.CurrentBlock {
 				return nil
 			}
 			// If the miner's height is greater than the node's we need to
 			// wait a bit longer for them to sync.
-			if mcg.Height > ncg.Height {
-				gwgMiner, errMiner := miner.GatewayGet()
-				gwgNode, errNode := node.GatewayGet()
-				return errors.Compose(fmt.Errorf("the node didn't catch up to the miner's height %v %v but have %v and %v peers respectively",
-					mcg.Height, ncg.Height, len(gwgNode.Peers), len(gwgMiner.Peers)), errMiner, errNode)
+			if lcg.Height != ncg.Height {
+				return errors.New("blockHeight doesn't match")
 			}
 			// If the miner's height is smaller than the node's we need a
 			// bit longer for them to sync.
-			if mcg.Height < ncg.Height {
-				return errors.New("the miner didn't catch up to the node's height")
+			if lcg.CurrentBlock != ncg.CurrentBlock {
+				return errors.New("ids don't match")
 			}
-			// If the miner's height is equal to the node's but still
-			// doesn't match, it needs to mine a block.
-			return errors.New("the node's current block's id does not equal the miner's")
+			return nil
 		})
 		if err != nil {
 			return err
@@ -440,20 +447,32 @@ func (tg *TestGroup) AddNodes(nps ...node.NodeParams) error {
 		newNodes[node] = struct{}{}
 	}
 
-	return tg.SetupNodes(newHosts, newNodes, newRenters)
+	return tg.setupNodes(newHosts, newNodes, newRenters)
 }
 
-// SetupNodes does the set up required for creating a test group
+// setupNodes does the set up required for creating a test group
 // and add nodes to a group
-func (tg *TestGroup) SetupNodes(setHosts, setNodes, setRenters map[*TestNode]struct{}) error {
-	// Fully connect nodes.
-	miner := mapToSlice(tg.miners)[0]
+func (tg *TestGroup) setupNodes(setHosts, setNodes, setRenters map[*TestNode]struct{}) error {
+	// Find richest miner.
+	var miner *TestNode
+	var balance types.Currency
+	for m := range tg.miners {
+		wg, err := m.WalletGet()
+		if err != nil {
+			return errors.New("failed to find richest miner")
+		}
+		if wg.ConfirmedSiacoinBalance.Cmp(balance) > 0 {
+			miner = m
+			balance = wg.ConfirmedSiacoinBalance
+		}
+	}
+	// Get all the nodes.
 	nodes := mapToSlice(tg.nodes)
 	if err := fullyConnectNodes(nodes); err != nil {
 		return build.ExtendErr("failed to fully connect nodes", err)
 	}
 	// Make sure the new nodes are synced.
-	if err := synchronizationCheck(miner, tg.nodes); err != nil {
+	if err := synchronizationCheck(tg.nodes); err != nil {
 		return build.ExtendErr("synchronization check 1 failed", err)
 	}
 	// Fund nodes.
@@ -486,7 +505,7 @@ func (tg *TestGroup) SetupNodes(setHosts, setNodes, setRenters map[*TestNode]str
 		return build.ExtendErr("renters failed to form contracts", err)
 	}
 	// Make sure all nodes are synced
-	if err := synchronizationCheck(miner, tg.nodes); err != nil {
+	if err := synchronizationCheck(tg.nodes); err != nil {
 		return build.ExtendErr("synchronization check 2 failed", err)
 	}
 	return nil
@@ -511,7 +530,7 @@ func (tg *TestGroup) SetRenterAllowance(renter *TestNode, allowance modules.Allo
 		return build.ExtendErr("renters failed to form contracts", err)
 	}
 	// Make sure all nodes are synced
-	if err := synchronizationCheck(miner, tg.nodes); err != nil {
+	if err := synchronizationCheck(tg.nodes); err != nil {
 		return build.ExtendErr("synchronization check 2 failed", err)
 	}
 	return nil
@@ -545,24 +564,35 @@ func (tg *TestGroup) RemoveNode(tn *TestNode) error {
 	delete(tg.miners, tn)
 
 	// Close node.
-	return tn.Close()
+	return tn.StopNode()
+}
+
+// StartNode starts a node from the group that has previously been stopped.
+func (tg *TestGroup) StartNode(tn *TestNode) error {
+	if _, exists := tg.nodes[tn]; !exists {
+		return errors.New("cannot start node that's not part of the group")
+	}
+	err := tn.StartNode()
+	if err != nil {
+		return err
+	}
+	if err := fullyConnectNodes(tg.Nodes()); err != nil {
+		return err
+	}
+	return synchronizationCheck(tg.nodes)
+}
+
+// StopNode stops a node of a group.
+func (tg *TestGroup) StopNode(tn *TestNode) error {
+	if _, exists := tg.nodes[tn]; !exists {
+		return errors.New("cannot stop node that's not part of the group")
+	}
+	return tn.StopNode()
 }
 
 // Sync syncs the node of the test group
 func (tg *TestGroup) Sync() error {
-	var miner *TestNode
-	var height types.BlockHeight
-	for m := range tg.miners {
-		cg, err := m.ConsensusGet()
-		if err != nil {
-			return err
-		}
-		if cg.Height > height {
-			miner = m
-			height = cg.Height
-		}
-	}
-	return synchronizationCheck(miner, tg.nodes)
+	return synchronizationCheck(tg.nodes)
 }
 
 // Nodes returns all the nodes of the group
